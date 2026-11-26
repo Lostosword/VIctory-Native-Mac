@@ -25,6 +25,11 @@ pub type Opener = fn(rate: u32, channels: u32, render: Render) -> io::Result<Box
 
 /// CoreAudio, or the silent clock if it cannot open.
 pub fn open_default(rate: u32, channels: u32, render: Render) -> io::Result<Box<dyn Output>> {
+    // VICTORY_MUTE=1: test runs that must not be heard; the title still hears
+    // its voices advance.
+    if std::env::var_os("VICTORY_MUTE").is_some_and(|v| v != "0") {
+        return Ok(Box::new(Silent::open(rate, channels, render)));
+    }
     match CoreAudio::open(rate, channels, render) {
         Ok(output) => Ok(Box::new(output)),
         Err((e, render)) => {

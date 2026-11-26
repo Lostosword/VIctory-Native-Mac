@@ -7,6 +7,7 @@ pub mod cityhash;
 pub mod pipelines;
 pub mod sgd5;
 pub mod shaderpack;
+pub mod watchdog;
 
 /// A specific build of the Grand Theft Auto VI executable we know how to run.
 #[derive(Debug, Clone, Copy)]

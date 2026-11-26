@@ -340,6 +340,25 @@ pub fn run(
             }
         });
     }
+    // The title's stall watchdog would end a slow start (shaders translated
+    // on the way, a busy Mac): its deliberate crash is stepped over unless
+    // VICTORY_TITLE_WATCHDOG=1.
+    if std::env::var("VICTORY_TITLE_WATCHDOG").as_deref() != Ok("1") {
+        use victory_game::watchdog::{AT, BEFORE, resume};
+        native::null_write::resume_null_writes(
+            image.base(),
+            image.info().size_of_image as usize,
+            |before, at, callers| {
+                let callers: Vec<[u8; AT]> = callers
+                    .iter()
+                    .filter_map(|c| <[u8; AT]>::try_from(*c).ok())
+                    .collect();
+                resume(before, at, &callers).map(|r| (r.rip, r.copy))
+            },
+            BEFORE,
+            AT,
+        );
+    }
     let launch = Launch(image, dlls);
     let go = move || {
         let launch = launch;

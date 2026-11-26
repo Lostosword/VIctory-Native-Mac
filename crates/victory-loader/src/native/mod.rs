@@ -14,6 +14,7 @@
 pub mod dll;
 mod image;
 pub mod seh;
+pub mod null_write;
 
 pub use image::{NativeImage, TlsTemplate};
 
