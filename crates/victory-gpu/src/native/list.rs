@@ -52,6 +52,12 @@ impl<B: GraphicsBackend> NativeHeap<B> {
         }
     }
 
+    /// Whether an entry still shows title texture `resource`.
+    pub fn still_shows(&self, resource: usize) -> bool {
+        let shown = self.images.borrow();
+        shown.entries.get(&resource).is_some_and(|l| l.iter().any(|i| shown.of.get(i) == Some(&resource)))
+    }
+
     /// The entries that show title texture `resource`, which they stop showing.
     pub fn take_entries(&self, resource: usize) -> Vec<usize> {
         let Shown { of, entries, gone } = &mut *self.images.borrow_mut();

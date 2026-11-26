@@ -46,6 +46,29 @@ impl TextureInfo {
         self.flags & (RENDER_TARGET | DEPTH_STENCIL) != 0
     }
 
+    /// How many of its most detailed mips the host leaves out of its copy (`VICTORY_TEXTURE_DROP`,
+    /// default 1, 0 keeps them all): textures the title samples, 1024 texels or more on a side,
+    /// with mips to spare. A host copy of every texture the title places costs as much again as
+    /// title memory (the title keeps a descriptor for nearly all of them, so none can be let go:
+    /// 10 GB of copies at the first world frame of a 7.6 GB Series S title); one mip less is a
+    /// quarter of that. Render targets and textures shaders write keep all theirs.
+    pub fn dropped_mips(&self) -> usize {
+        static DROP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let drop = *DROP.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_DROP").ok().and_then(|v| v.parse().ok()).unwrap_or(1).min(4)
+        });
+        if drop == 0
+            || self.render_target()
+            || self.flags & UNORDERED_ACCESS != 0
+            || self.dimension == Dimension::Tex3d
+            || self.width.max(self.height) < 1024
+        {
+            return 0;
+        }
+        // At least one mip stays.
+        drop.min(self.layout.mips.len().saturating_sub(1))
+    }
+
     /// The backend's description of it; `None` for formats or shapes the host does not know.
     pub fn desc(&self) -> Option<TextureDesc> {
         let depth = self.flags & DEPTH_STENCIL != 0;
@@ -62,13 +85,16 @@ impl TextureInfo {
             _ if self.depth_or_layers > 1 => (TexDim::D2Array, self.depth_or_layers as usize),
             _ => (TexDim::D2, 1),
         };
+        // Texels, halved per mip left out (`layout.mips` counts blocks for block formats).
+        let drop = self.dropped_mips();
+        let (width, height) = ((self.width as usize >> drop).max(1), (self.height.max(1) as usize >> drop).max(1));
         Some(TextureDesc {
             dim,
             format,
-            width: self.width as usize,
-            height: self.height.max(1) as usize,
+            width,
+            height,
             depth_or_layers: d,
-            mips: self.layout.mips.len().max(1),
+            mips: self.layout.mips.len().saturating_sub(drop).max(1),
             render_target: self.render_target(),
             unordered_access: self.flags & UNORDERED_ACCESS != 0,
         })
@@ -111,7 +137,9 @@ pub fn upload<B: ResourceBackend>(
         layout.slices
     };
     let n = layout.desc.element_bytes as usize;
-    for mip in 0..layout.mips.len() as u32 {
+    // The host copy starts at the first mip it keeps.
+    let drop = info.dropped_mips() as u32;
+    for mip in drop..layout.mips.len() as u32 {
         let m = &layout.mips[mip as usize];
         let row = m.width as usize * n;
         let slice_pitch = row * m.height as usize;
@@ -122,7 +150,7 @@ pub fn upload<B: ResourceBackend>(
                 .detile(tiled, mip, slice, &mut linear, row, slice_pitch)
                 .map_err(|e| format!("detile mip {mip} slice {slice}: {e:?}"))?;
             to_host(info.format, &mut linear);
-            backend.upload_texture(tex, mip as usize, slice as usize, &linear, row, slice_pitch);
+            backend.upload_texture(tex, (mip - drop) as usize, slice as usize, &linear, row, slice_pitch);
         }
     }
     Ok(())
@@ -412,7 +440,7 @@ impl<B: PresentBackend> Title<B> {
                 return false;
             }
         };
-        self.host.register_texture(key, &tex);
+        self.host.register_texture_dropping(key, &tex, info.dropped_mips());
         // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
         // it changes, as it is not otherwise seen (a GPU write never changes title memory).
         watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target())));
@@ -445,6 +473,25 @@ impl<B: PresentBackend> Title<B> {
             },
         );
         true
+    }
+
+    /// Host textures alive (made from title textures), how many of them were placed (no title
+    /// object), their title memory in MB (and once each, overlaps counted once), and title textures not made yet: the frame log's
+    /// `host_textures` fields.
+    pub fn texture_stats(&self) -> (usize, usize, usize, usize, usize) {
+        let mb = self.textures.values().map(|t| t.info.size).sum::<usize>() >> 20;
+        // The title memory they cover, overlaps counted once.
+        let mut ranges: Vec<(usize, usize)> =
+            self.textures.values().map(|t| (t.info.memory as usize, t.info.memory as usize + t.info.size)).collect();
+        ranges.sort_unstable();
+        let (mut covered, mut end) = (0usize, 0usize);
+        for (a, b) in ranges {
+            if b > end {
+                covered += b - a.max(end);
+                end = b;
+            }
+        }
+        (self.textures.len(), self.placed.len(), mb, covered >> 20, self.pending.len())
     }
 
     /// The format of the host texture of title texture `key`.
@@ -488,6 +535,37 @@ impl<B: PresentBackend> Title<B> {
         }
     }
 
+    /// Releases, every 64 calls, the placed textures no heap entry shows any more. The title
+    /// places textures in memory it streams into and reuses; nothing tells the host when it is
+    /// done with one, so they piled up (38,000 host textures, 10 GB of copies over 7.3 GB of title
+    /// memory, at the first world frame of a 7.6 GB Series S title) and their memory was still
+    /// scanned and detiled. A texture no entry shows cannot be sampled; a view that names it
+    /// again makes it again (`glue::mirror`). Render and depth targets stay: passes name them
+    /// without views. `VICTORY_KEEP_PLACED=1` keeps them all, as before.
+    fn release_unshown_placed(&mut self) {
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *KEEP.get_or_init(|| std::env::var_os("VICTORY_KEEP_PLACED").is_some_and(|v| v != "0"))
+            || !CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(64)
+        {
+            return;
+        }
+        let unshown: Vec<u64> = self
+            .placed
+            .iter()
+            .filter(|(_, (key, _))| {
+                self.textures.get(key).is_none_or(|t| !t.info.render_target() && t.info.flags & UNORDERED_ACCESS == 0)
+                    && !self.host.shown(*key)
+            })
+            .map(|(&a, _)| a)
+            .collect();
+        for a in unshown {
+            let (key, _) = self.placed.remove(&a).expect("listed above");
+            self.host.release_resource(key);
+            self.texture_released(key);
+        }
+    }
+
     /// Releases the textures placed in pools the title released since the last call.
     fn release_placed(&mut self) {
         let gone = self.host.released_pools();
@@ -523,6 +601,7 @@ impl<B: PresentBackend> Title<B> {
     /// found changed since.
     pub fn sync_dirty(&mut self) {
         self.release_placed();
+        self.release_unshown_placed();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         for key in &dirty {
             // Missed by the sampled probe, so read it whole while it stays hot.

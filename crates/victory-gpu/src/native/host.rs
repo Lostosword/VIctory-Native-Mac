@@ -39,6 +39,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// world (`newTextureView` per record) and thousands of GPU objects. The texture is held
     /// weakly; views of released textures go at the next sweep.
     views: RefCell<HashMap<(usize, Format, usize, usize), (std::rc::Weak<B::Texture>, Rc<B::Texture>)>>,
+    /// Title textures whose host copy leaves out their first mips, and how many.
+    dropped: RefCell<HashMap<usize, usize>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
@@ -151,6 +153,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             maps: RefCell::default(),
             resources: RefCell::default(),
             views: RefCell::default(),
+            dropped: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
@@ -267,6 +270,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
+        self.register_texture_dropping(key, texture, 0);
+    }
+
+    /// [`Self::register_texture`] for a copy that leaves out the title texture's first `dropped`
+    /// mips (`TextureInfo::dropped_mips`): views name title mips, the copy's start that many later.
+    pub fn register_texture_dropping(&self, key: usize, texture: &Rc<B::Texture>, dropped: usize) {
+        if dropped > 0 {
+            self.dropped.borrow_mut().insert(key, dropped);
+        } else {
+            self.dropped.borrow_mut().remove(&key);
+        }
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
@@ -366,6 +380,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// Whether a heap entry still shows title texture `key`.
+    pub fn shown(&self, key: usize) -> bool {
+        self.heaps.borrow().iter().any(|h| h.still_shows(key))
+    }
+
     /// Heap entries cleared so far because the texture they showed was released.
     pub fn cleared(&self) -> u64 {
         self.cleared.get()
@@ -438,7 +457,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 match (mips, format) {
                     (Some((first, count)), Some(format)) if count > 0 => {
-                        let v = self.texture_view(tex, format, first as usize, count as usize)?;
+                        // Title mips to the copy's: a view of left-out mips alone shows the most
+                        // detailed one kept.
+                        let drop = self.dropped.borrow().get(&resource).copied().unwrap_or(0);
+                        let (first, count) = (first as usize, count as usize);
+                        let start = first.saturating_sub(drop);
+                        let end = (first + count).saturating_sub(drop).max(start + 1);
+                        let v = self.texture_view(tex, format, start, end - start)?;
                         self.backend.write_texture(&heap.heap, index, &v, 0.0);
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
@@ -475,7 +500,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
             },
         )?);
         let mut views = self.views.borrow_mut();
-        if views.len() >= 1 << 14 {
+        // A view keeps its texture's memory: views of released textures go every 256 new views.
+        if views.len() % 256 == 255 {
             views.retain(|_, (parent, _)| parent.strong_count() > 0);
         }
         views.insert(key, (Rc::downgrade(tex), v.clone()));
