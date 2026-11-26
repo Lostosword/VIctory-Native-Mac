@@ -592,6 +592,12 @@ pub trait GraphicsBackend: ResourceBackend {
         &self,
         desc: &RenderPipelineDesc<'_>,
     ) -> Result<Self::RenderPipeline, String>;
+    /// Whether a pipeline [`Self::create_render_pipeline`] made can draw yet: a backend that
+    /// compiles them in the background hands them out at once, and draws of one still compiling
+    /// are left out.
+    fn render_pipeline_ready(&self, _pipeline: &Self::RenderPipeline) -> bool {
+        true
+    }
     fn submit_passes(
         &self,
         queue: &Self::Queue,

@@ -117,8 +117,33 @@ impl Texture {
 
 pub struct Sampler(Retained<ProtocolObject<dyn MTLSamplerState>>);
 
+type PsoState = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+
+/// A render pipeline state, or one Metal compiles in the background: a pipeline the archive does
+/// not have is handed out at once and its draws are left out until it is ready, so a frame that
+/// meets hundreds of new pipelines (the first world frame: about 800, 200 ms each) has Metal's
+/// compiler service build them side by side instead of one after another on the host's thread.
+/// `VICTORY_SYNC_PIPELINES=1`: compiled at once, as before.
+enum Pso {
+    Made(PsoState),
+    Compiling(std::sync::Arc<std::sync::OnceLock<Result<PsoState, String>>>),
+}
+
+impl Pso {
+    fn get(&self) -> Option<&PsoState> {
+        match self {
+            Pso::Made(p) => Some(p),
+            Pso::Compiling(slot) => slot.get().and_then(|r| r.as_ref().ok()),
+        }
+    }
+}
+
+/// Pipelines Metal is compiling for us, and how many it has finished.
+static COMPILING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub struct RenderPipeline {
-    pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    pso: Pso,
     depth: Option<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
     cull: MTLCullMode,
     raster: Raster,
@@ -1049,7 +1074,7 @@ impl GraphicsBackend for Metal {
                 .dev
                 .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(&md, MTLPipelineOption::None, None)
                 .map_err(|e| e.localizedDescription().to_string())?;
-            (pso, Some(size([x as usize, y as usize, z as usize])))
+            (Pso::Made(pso), Some(size([x as usize, y as usize, z as usize])))
         } else {
             (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
         };
@@ -1085,6 +1110,10 @@ impl GraphicsBackend for Metal {
                 None
             },
         })
+    }
+
+    fn render_pipeline_ready(&self, p: &RenderPipeline) -> bool {
+        p.pso.get().is_some()
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
@@ -1258,7 +1287,7 @@ impl Metal {
         d: &RenderPipelineDesc<'_>,
         vf: &ProtocolObject<dyn MTLFunction>,
         ff: Option<&ProtocolObject<dyn MTLFunction>>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
+    ) -> Result<Pso, String> {
         let pd = MTLRenderPipelineDescriptor::new();
         pd.setVertexFunction(Some(vf));
         pd.setFragmentFunction(ff);
@@ -1295,13 +1324,52 @@ impl Metal {
                 pd.setStencilAttachmentPixelFormat(pixel_format(f));
             }
         }
+        static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sync = *SYNC.get_or_init(|| std::env::var_os("VICTORY_SYNC_PIPELINES").is_some_and(|v| v != "0"));
         match self.archive() {
-            Some(a) => a.render(&self.dev, &pd),
-            None => self
+            Some(a) if sync => a.render(&self.dev, &pd).map(Pso::Made),
+            Some(a) => match a.cached_render(&self.dev, &pd) {
+                Some(p) => Ok(Pso::Made(p)),
+                None => Ok(self.compile_in_background(&pd)),
+            },
+            None if sync => self
                 .dev
                 .newRenderPipelineStateWithDescriptor_error(&pd)
+                .map(Pso::Made)
                 .map_err(|e| e.localizedDescription().to_string()),
+            None => Ok(self.compile_in_background(&pd)),
         }
+    }
+
+    /// Has Metal compile `pd` on its own threads; the pipeline is ready once the slot is set.
+    fn compile_in_background(&self, pd: &MTLRenderPipelineDescriptor) -> Pso {
+        use std::sync::atomic::Ordering::Relaxed;
+        let slot = std::sync::Arc::new(std::sync::OnceLock::new());
+        let done = slot.clone();
+        let n = COMPILING.fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(n, "metal: render pipelines compiled in the background (VICTORY_SYNC_PIPELINES=1: at once)");
+        }
+        let handler = block2::RcBlock::new(move |state: *mut ProtocolObject<dyn MTLRenderPipelineState>, error: *mut objc2_foundation::NSError| {
+            // SAFETY: Metal passes a pipeline state or an error, valid for the call.
+            let made = match unsafe { Retained::retain(state) } {
+                Some(p) => Ok(p),
+                // SAFETY: the error Metal passes with no state, or null.
+                None => Err(unsafe { error.as_ref() }
+                    .map_or_else(|| "no pipeline state".to_owned(), |e| e.localizedDescription().to_string())),
+            };
+            if let Err(e) = &made {
+                tracing::warn!(error = %e, "metal: a render pipeline compiled in the background failed; its draws are left out");
+            }
+            let _ = done.set(made);
+            COMPILED.fetch_add(1, Relaxed);
+        });
+        // SAFETY: a complete descriptor; Metal copies the block and calls it once.
+        unsafe {
+            self.dev
+                .newRenderPipelineStateWithDescriptor_completionHandler(pd, &*handler as *const _ as *mut _);
+        }
+        Pso::Compiling(slot)
     }
 }
 
@@ -1915,7 +1983,11 @@ impl Metal {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
-            e.setRenderPipelineState(&d.pipeline.pso);
+            // Recorded only once ready (`render_pipeline_ready`).
+            let Some(pso) = d.pipeline.pso.get() else {
+                continue;
+            };
+            e.setRenderPipelineState(pso);
             e.setCullMode(d.pipeline.cull);
             let r = &d.pipeline.raster;
             e.setFrontFacingWinding(if r.front_ccw {

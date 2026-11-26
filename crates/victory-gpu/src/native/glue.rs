@@ -1131,6 +1131,12 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
         }
         return None;
     };
+    // Metal is still compiling it in the background (`victory_metal::gfx::Pso`): this draw is
+    // left out, the next ones draw once it is ready.
+    if !victory_backend::resources::GraphicsBackend::render_pipeline_ready(&t.host.backend, &pso) {
+        dropped("a draw whose pipeline Metal is still compiling");
+        return None;
+    }
     if pso.mesh_threads().is_some() != mesh {
         dropped(if mesh { "a mesh dispatch of a vertex pipeline" } else { "a draw of a mesh pipeline" });
         trace_drop(l);

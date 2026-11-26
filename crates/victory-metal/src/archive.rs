@@ -14,6 +14,23 @@ use std::time::{Duration, Instant};
 
 const SAVE_EVERY: Duration = Duration::from_secs(5);
 
+/// `VICTORY_TRACE_PIPE_TIMES=1`: time spent making compute pipelines, by step (library load,
+/// archive lookup, archive add, made from the archive, all), logged every 64 pipelines.
+pub(crate) fn note_time(step: usize, since: Instant) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_PIPE_TIMES").is_some()) {
+        return;
+    }
+    US[step].fetch_add(since.elapsed().as_micros() as u64, Relaxed);
+    if step == 4 && (N.fetch_add(1, Relaxed) + 1).is_multiple_of(64) {
+        let ms = |i: usize| US[i].load(Relaxed) / 1000;
+        tracing::info!(n = N.load(Relaxed), load_ms = ms(0), lookup_ms = ms(1), add_ms = ms(2), from_archive_ms = ms(3), all_ms = ms(4), "compute pipeline times");
+    }
+}
+
 pub(crate) struct Archive {
     archive: Retained<ProtocolObject<dyn MTLBinaryArchive>>,
     list: Retained<NSArray<ProtocolObject<dyn MTLBinaryArchive>>>,
@@ -62,13 +79,35 @@ impl Archive {
         ) {
             return Ok(p);
         }
-        let p = dev
-            .newRenderPipelineStateWithDescriptor_error(d)
-            .map_err(|e| e.localizedDescription().to_string())?;
+        // A miss is compiled once: into the archive, then the pipeline is made from it (compiling
+        // it for the pipeline and again for the archive cost each new pipeline twice).
         if self.archive.addRenderPipelineFunctionsWithDescriptor_error(d).is_ok() {
             self.added_one();
+            if let Ok(p) = dev.newRenderPipelineStateWithDescriptor_options_reflection_error(
+                d,
+                MTLPipelineOption::FailOnBinaryArchiveMiss,
+                None,
+            ) {
+                return Ok(p);
+            }
         }
-        Ok(p)
+        dev.newRenderPipelineStateWithDescriptor_error(d)
+            .map_err(|e| e.localizedDescription().to_string())
+    }
+
+    /// The pipeline of `d` if the archive has it (compiled in an earlier run), else nothing.
+    pub(crate) fn cached_render(
+        &self,
+        dev: &Dev,
+        d: &MTLRenderPipelineDescriptor,
+    ) -> Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        d.setBinaryArchives(Some(&self.list));
+        dev.newRenderPipelineStateWithDescriptor_options_reflection_error(
+            d,
+            MTLPipelineOption::FailOnBinaryArchiveMiss,
+            None,
+        )
+        .ok()
     }
 
     /// As [`Self::render`], for a compute function.
@@ -80,20 +119,34 @@ impl Archive {
         let d = MTLComputePipelineDescriptor::new();
         d.setComputeFunction(Some(f));
         d.setBinaryArchives(Some(&self.list));
-        if let Ok(p) = dev.newComputePipelineStateWithDescriptor_options_reflection_error(
+        let t = Instant::now();
+        let hit = dev.newComputePipelineStateWithDescriptor_options_reflection_error(
             &d,
             MTLPipelineOption::FailOnBinaryArchiveMiss,
             None,
-        ) {
+        );
+        note_time(1, t);
+        if let Ok(p) = hit {
             return Ok(p);
         }
-        let p = dev
-            .newComputePipelineStateWithDescriptor_options_reflection_error(&d, MTLPipelineOption::None, None)
-            .map_err(|e| e.localizedDescription().to_string())?;
-        if self.archive.addComputePipelineFunctionsWithDescriptor_error(&d).is_ok() {
+        let t = Instant::now();
+        let added = self.archive.addComputePipelineFunctionsWithDescriptor_error(&d).is_ok();
+        note_time(2, t);
+        if added {
             self.added_one();
+            let t = Instant::now();
+            let made = dev.newComputePipelineStateWithDescriptor_options_reflection_error(
+                &d,
+                MTLPipelineOption::FailOnBinaryArchiveMiss,
+                None,
+            );
+            note_time(3, t);
+            if let Ok(p) = made {
+                return Ok(p);
+            }
         }
-        Ok(p)
+        dev.newComputePipelineStateWithDescriptor_options_reflection_error(&d, MTLPipelineOption::None, None)
+            .map_err(|e| e.localizedDescription().to_string())
     }
 
     fn added_one(&self) {

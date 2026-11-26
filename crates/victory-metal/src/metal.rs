@@ -230,13 +230,16 @@ impl Metal {
         layout: Option<&RootLayout>,
     ) -> Result<Pipeline, String> {
         let (_, lib) = converted.map_err(|e| e.to_string())?;
+        let t0 = std::time::Instant::now();
         let l = self.load_library(&lib)?;
+        crate::archive::note_time(0, t0);
         let name = l
             .functionNames()
             .iter()
             .next()
             .ok_or("converted library is empty")?;
         let f = l.newFunctionWithName(&name).ok_or("no function")?;
+        let t0 = std::time::Instant::now();
         let p = match self.archive() {
             Some(a) => a.compute(&self.dev, &f)?,
             None => self
@@ -244,6 +247,7 @@ impl Metal {
                 .newComputePipelineStateWithFunction_error(&f)
                 .map_err(|e| e.localizedDescription().to_string())?,
         };
+        crate::archive::note_time(4, t0);
         Ok(Pipeline(p, self.static_samplers(layout)?))
     }
 

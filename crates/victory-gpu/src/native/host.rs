@@ -33,6 +33,12 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
     released: RefCell<Vec<usize>>,
     resources: RefCell<HashMap<usize, Res<B>>>,
+    /// Texture views a descriptor record asked for, by texture, format and mips: the title
+    /// rewrites tens of thousands of records a frame with plain stores (`remirror_tables`), mostly
+    /// to views it named before, and making each again was the host thread's whole time in the
+    /// world (`newTextureView` per record) and thousands of GPU objects. The texture is held
+    /// weakly; views of released textures go at the next sweep.
+    views: RefCell<HashMap<(usize, Format, usize, usize), (std::rc::Weak<B::Texture>, Rc<B::Texture>)>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
@@ -144,6 +150,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             released: RefCell::default(),
             maps: RefCell::default(),
             resources: RefCell::default(),
+            views: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
@@ -431,16 +438,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 match (mips, format) {
                     (Some((first, count)), Some(format)) if count > 0 => {
-                        let v = self.backend.create_texture_view(
-                            tex,
-                            &ViewDesc {
-                                format,
-                                mips: (first as usize, count as usize),
-                                // Every slice of an array (the backend cuts it to what is there):
-                                // one slice showed an array view's first alone.
-                                slices: (0, usize::MAX),
-                            },
-                        )?;
+                        let v = self.texture_view(tex, format, first as usize, count as usize)?;
                         self.backend.write_texture(&heap.heap, index, &v, 0.0);
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
@@ -455,6 +453,33 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         heap.mirrored.borrow_mut().insert(index, record_at(handle));
         Ok(true)
+    }
+
+    /// The view of `tex` in `format` over `count` mips from `first`, made once (`Self::views`).
+    fn texture_view(&self, tex: &Rc<B::Texture>, format: Format, first: usize, count: usize) -> Result<Rc<B::Texture>, String> {
+        let key = (Rc::as_ptr(tex) as usize, format, first, count);
+        if let Some((parent, view)) = self.views.borrow().get(&key)
+            // The same address may hold a texture made after that one was released.
+            && parent.upgrade().is_some_and(|p| Rc::ptr_eq(&p, tex))
+        {
+            return Ok(view.clone());
+        }
+        let v = Rc::new(self.backend.create_texture_view(
+            tex,
+            &ViewDesc {
+                format,
+                mips: (first, count),
+                // Every slice of an array (the backend cuts it to what is there):
+                // one slice showed an array view's first alone.
+                slices: (0, usize::MAX),
+            },
+        )?);
+        let mut views = self.views.borrow_mut();
+        if views.len() >= 1 << 14 {
+            views.retain(|_, (parent, _)| parent.strong_count() > 0);
+        }
+        views.insert(key, (Rc::downgrade(tex), v.clone()));
+        Ok(v)
     }
 
     /// Minimum entries of each bound table checked at submission when a shader has no
