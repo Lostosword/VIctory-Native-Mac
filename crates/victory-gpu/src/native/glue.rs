@@ -805,7 +805,9 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
     // not translated yet is put off: its work is dropped this time (not cached, so a later draw
     // makes it), and its shaders go to the front of the prewarm pool.
     let frame = crate::frame::current();
-    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(frame, std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
+    // `VICTORY_NEVER_WAIT_TRANSLATIONS=1`: not translated yet, put off whatever the budget.
+    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(frame, std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
+        || never_wait();
     if spent
         && let Some((stages, _)) = crate::pipeline::native_stages(key as This)
         && stages.iter().any(|(_, s)| !s.native_ready())
@@ -826,6 +828,25 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
         t.pipelines.insert(key, made.clone());
     }
     made
+}
+
+/// Whether a pipeline whose translations are not made yet is always put off instead of waited for
+/// within the frame's budget (`VICTORY_NEVER_WAIT_TRANSLATIONS=1`, title runs only). Waiting holds
+/// the title's lock behind a prewarm worker's translation (a `OnceLock` another thread is
+/// initializing): one that took minutes froze the game about 3 minutes into the world, its
+/// watchdog firing every 30 s. Never waiting kept it going, but the first world frame then put
+/// off its pipelines again and again and did not end in 7 minutes: off by default for now.
+fn never_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    TITLE_RUN.load(Ordering::Relaxed)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_NEVER_WAIT_TRANSLATIONS").is_some_and(|v| v != "0"))
+}
+
+static TITLE_RUN: AtomicBool = AtomicBool::new(false);
+
+/// This process runs a title (not tests or a tool): translations are never waited for.
+pub(crate) fn set_title_run() {
+    TITLE_RUN.store(true, Ordering::Relaxed);
 }
 
 /// When this frame made its first new pipeline, and pipelines put off since ([`pipe`]).
@@ -1202,7 +1223,8 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     // As in `pipe`: past the frame's budget, a translation not made yet goes to a worker and the
     // draw is dropped this time (nothing is cached; the worker's result is, on disk or in the
     // shader).
-    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
+    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
+        || never_wait();
     if spent && rect && !g.vs_source.rect_ready() {
         let s = g.vs_source.clone();
         put_off(format!("{} rect", s.hash), move || drop(s.native_rect()));

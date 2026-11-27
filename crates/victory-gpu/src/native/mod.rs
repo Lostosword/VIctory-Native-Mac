@@ -48,6 +48,9 @@ pub use glue::{
 #[cfg(target_os = "macos")]
 pub fn set_background_pipelines(on: bool) {
     victory_metal::gfx::set_background_pipelines(on);
+    if on {
+        glue::set_title_run();
+    }
 }
 
 /// Reads `out.len()` bytes at `at` from this process, false if they cannot be read (unmapped
