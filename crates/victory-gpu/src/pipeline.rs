@@ -83,12 +83,59 @@ pub(crate) struct Shader {
     /// host put it together), to read it again for [`native_threads`].
     #[cfg(target_os = "macos")]
     at: std::sync::atomic::AtomicUsize,
+    /// A compute program skipped by the name its container gives it ([`skipped_names`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) skipped_by_name: bool,
 }
 
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)
     }
+}
+
+/// Compute programs skipped by the name their container gives them (`VICTORY_SKIP_NAMES`, between
+/// commas; empty skips none). By default the title's resolves of its own ray tracing: they walk a
+/// hierarchy of bounds the host never builds (the title's builder does not run), over memory left
+/// as it was, and a walk that meets a loop there runs until the GPU gives up. In the world one
+/// submission in three held the GPU about 4 s (frames 10 s apart, the window black); under Wine
+/// the same programs hung the GPU for good.
+#[cfg(target_os = "macos")]
+fn skipped_names() -> &'static [Vec<u8>] {
+    static NAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_NAMES").unwrap_or_else(|_| "CS_RaytracingResolve".to_owned());
+        let names: Vec<Vec<u8>> =
+            value.split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| n.as_bytes().to_vec()).collect();
+        tracing::info!(names = value, "compute programs skipped by name (VICTORY_SKIP_NAMES)");
+        names
+    })
+}
+
+/// Whether compute programs that walk a ray-tracing hierarchy (`image_bvh*_intersect_ray`) are
+/// skipped (`VICTORY_SKIP_RAY_WALKS=0` runs them). Their container carries no name on the native
+/// path (the host puts it together from the pieces of device method 0x218), so the resolves
+/// [`skipped_names`] means are known by what they do: the host never builds the hierarchy (the
+/// title's builder does not run), and a walk over memory left as it was held the GPU about 4 s
+/// in one submission in three in the world.
+#[cfg(target_os = "macos")]
+fn skip_ray_walks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SKIP_RAY_WALKS").map_or(true, |v| v != "0"))
+}
+
+/// Whether a container's GFX10 code has a ray-tracing hierarchy walk (`image_bvh*_intersect_ray`).
+#[cfg(target_os = "macos")]
+fn walks_rays(container: &[u8]) -> bool {
+    let Ok(c) = victory_shader::dxbc::Container::parse(container) else {
+        return false;
+    };
+    c.parts.iter().any(|p| {
+        victory_shader::native::fspx_program(p.data)
+            .ok()
+            .and_then(|program| victory_shader::gfx10::decode(&program.code).ok())
+            .is_some_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+    })
 }
 
 /// Every container seen, by full content hash.
@@ -172,6 +219,10 @@ impl Shader {
             threads: std::sync::OnceLock::new(),
             #[cfg(target_os = "macos")]
             at: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(target_os = "macos")]
+            skipped_by_name: stage == "compute"
+                && (skipped_names().iter().any(|name| bytes.windows(name.len()).any(|w| w == name.as_slice()))
+                    || (skip_ray_walks() && walks_rays(bytes))),
         }
     }
 
@@ -742,6 +793,36 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
     Ok(shaders)
 }
 
+/// Debugging aid (`VICTORY_TRACE_COMPUTE_RECORD=1`): the words of a compute description past the
+/// pieces the host reads, and the text any of them points at (the first 200 descriptions).
+#[cfg(target_os = "macos")]
+fn trace_compute_record(desc: *const u8) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_COMPUTE_RECORD").is_some())
+        || N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200
+    {
+        return;
+    }
+    let mut words = [0u8; 0x40];
+    if !crate::native::safe_read(desc.wrapping_add(8 + 0x40), &mut words) {
+        return;
+    }
+    let mut texts = Vec::new();
+    for w in words.chunks_exact(8) {
+        let v = u64::from_le_bytes(w.try_into().expect("8 bytes"));
+        let mut text = [0u8; 64];
+        if v > 0x10000 && v < 1 << 47 && crate::native::safe_read(v as *const u8, &mut text) {
+            let printable: String = text.iter().take_while(|&&b| (0x20..0x7f).contains(&b)).map(|&b| b as char).collect();
+            if printable.len() >= 4 {
+                texts.push(format!("{v:#x}={printable}"));
+            }
+        }
+    }
+    let hex: Vec<String> = words.chunks_exact(8).map(|w| format!("{:#x}", u64::from_le_bytes(w.try_into().expect("8 bytes")))).collect();
+    tracing::info!(words = ?hex, ?texts, "compute record");
+}
+
 /// Device method 0x218: a compute pipeline. The description is a root signature pointer and one
 /// 0x60-byte record, the pieces an `FSPX` part is made of (observed at run time, as the console
 /// runtime takes them): pointer and size of the pipeline registers (kind 0, 0x1c bytes), of the
@@ -761,6 +842,7 @@ pub(crate) extern "system" fn create_compute_pieces(
     {
         // SAFETY: the title passes a description of this layout.
         let root = crate::root::blob_of(unsafe { desc.cast::<This>().read_unaligned() });
+        trace_compute_record(desc);
         // SAFETY: as above.
         if let Some(container) = unsafe { compute_container(root.as_deref(), desc.add(8)) } {
             return hand_out(

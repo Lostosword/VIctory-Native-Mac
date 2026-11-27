@@ -57,6 +57,26 @@ pub struct NativeHost<B: GraphicsBackend> {
     passes: std::cell::Cell<u64>,
 }
 
+/// `VICTORY_TRACE_EXECUTE_TIMES=1`: host time per submission by phase (commands prepared: views
+/// remirrored, arguments translated; passes built; encoded and committed), logged every 256.
+fn execute_times(cmds: usize, start: std::time::Instant, prepped: std::time::Instant, built: std::time::Instant) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static T: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_EXECUTE_TIMES").is_some()) {
+        return;
+    }
+    let now = std::time::Instant::now();
+    T[0].fetch_add((prepped - start).as_micros() as u64, Relaxed);
+    T[1].fetch_add((built - prepped).as_micros() as u64, Relaxed);
+    T[2].fetch_add((now - built).as_micros() as u64, Relaxed);
+    T[3].fetch_add(cmds as u64, Relaxed);
+    if (T[4].fetch_add(1, Relaxed) + 1).is_multiple_of(256) {
+        let ms = |i: usize| T[i].swap(0, Relaxed) / 1000;
+        tracing::info!(prep_ms = ms(0), build_ms = ms(1), submit_ms = ms(2), commands = T[3].swap(0, Relaxed), "execute times (last 256 submissions)");
+    }
+}
+
 /// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
 /// list (or this queue's next segment) may wait for with no other way to go on.
 fn lost_fill<B: GraphicsBackend>(c: &Cmd<B>, why: &str) {
@@ -1123,6 +1143,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
         let _counted = super::descriptor_trace::Submission;
+        let t_start = std::time::Instant::now();
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
         // waits for one of those then holds everything behind it for good. (A title shader's
@@ -1213,6 +1234,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
         }
 
+        let t_prepped = std::time::Instant::now();
         let mut groups = vec![];
         let mut i = 0;
         while i < cmds.len() {
@@ -1394,14 +1416,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
             });
         }
         self.passes.set(self.passes.get() + passes.len() as u64);
-        self.backend.submit_passes(
+        let t_built = std::time::Instant::now();
+        let r = self.backend.submit_passes(
             queue,
             &PassSubmission {
                 waits,
                 passes: &passes,
                 signals,
             },
-        )
+        );
+        execute_times(cmds.len(), t_start, t_prepped, t_built);
+        r
     }
 }
 

@@ -573,16 +573,21 @@ impl Metal {
         &self,
         heap: &Heap,
         named: &mut Vec<*const Heap>,
-        mut use_res: impl FnMut(&ProtocolObject<dyn MTLResource>),
+        use_res: impl FnOnce(NonNull<NonNull<ProtocolObject<dyn MTLResource>>>, usize),
     ) {
         if heap.set.is_some() || named.contains(&(heap as *const Heap)) {
             return;
         }
         named.push(heap);
-        use_res(ProtocolObject::from_ref(&*heap.buf));
         let refs = heap.refs.borrow().len() as u64;
         let allocations = heap.alloc_counts.borrow();
-        allocations.values().for_each(|(_, r)| use_res(r));
+        // One `useResources` for the heap's buffer and every resource its entries show: one
+        // `useResource` each (tens of thousands per pass in the world, each an Objective-C call
+        // through Rosetta) was half the host thread's time.
+        let mut all: Vec<NonNull<ProtocolObject<dyn MTLResource>>> = Vec::with_capacity(1 + allocations.len());
+        all.push(NonNull::from(ProtocolObject::<dyn MTLResource>::from_ref(&*heap.buf)));
+        all.extend(allocations.values().map(|(_, r)| NonNull::from(&**r)));
+        use_res(NonNull::new(all.as_mut_ptr()).expect("a vector's pointer"), all.len());
         self.count(|c| {
             c.heap_resources += 1 + allocations.len() as u64;
             c.heap_entries = c.heap_entries.max(refs);
@@ -692,8 +697,9 @@ impl Metal {
             if let Some(h) = h {
                 // SAFETY: a live buffer at an in-range slot.
                 unsafe { e.setBuffer_offset_atIndex(Some(&h.buf), 0, slot) };
-                self.use_heap_encoder(h, named, |r| {
-                    e.useResource_usage(r, MTLResourceUsage::Read | MTLResourceUsage::Write)
+                self.use_heap_encoder(h, named, |list, n| {
+                    // SAFETY: `n` live resources at `list`, held by the heap for the call.
+                    unsafe { e.useResources_count_usage(list, n, MTLResourceUsage::Read | MTLResourceUsage::Write) }
                 });
             }
         }
@@ -754,12 +760,16 @@ impl Metal {
                     }
                     e.setFragmentBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                 }
-                self.use_heap_encoder(h, named, |r| {
-                    e.useResource_usage_stages(
-                        r,
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                        first | MTLRenderStages::Fragment,
-                    )
+                self.use_heap_encoder(h, named, |list, n| {
+                    // SAFETY: `n` live resources at `list`, held by the heap for the call.
+                    unsafe {
+                        e.useResources_count_usage_stages(
+                            list,
+                            n,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                            first | MTLRenderStages::Fragment,
+                        )
+                    }
                 });
             }
         }
@@ -1207,8 +1217,8 @@ impl GraphicsBackend for Metal {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
                 if done.error().is_none()
                     && let Some(t) = started
-                    && t.elapsed().as_secs_f64() > 1.0
-                    && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+                    && (t.elapsed().as_secs_f64() > 1.0 || done.GPUEndTime() - done.GPUStartTime() > 0.1)
+                    && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5000
                 {
                     tracing::warn!(
                         "metal: slow command buffer {l} took {:.3}s (gpu {:.3}s, kernel {:.3}s) | {enc}",

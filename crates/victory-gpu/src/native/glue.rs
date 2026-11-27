@@ -898,6 +898,24 @@ fn make_host_pipe(
         .map(|(stage, s)| format!("{stage} {}", s.hash))
         .collect::<Vec<_>>()
         .join(" ");
+    // Debugging aid: VICTORY_SKIP_SHADERS=<hash>,... refuses pipelines with one of these shaders.
+    static SKIP: OnceLock<Vec<String>> = OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_SHADERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if let Some((_, s)) = stages.iter().find(|(_, s)| skip.contains(&s.hash)) {
+        t.refused_translation(&name, format!("{} skipped (VICTORY_SKIP_SHADERS)", s.hash));
+        return Pipe::Refused;
+    }
+    if let Some((_, s)) = stages.iter().find(|(_, s)| s.skipped_by_name) {
+        t.refused_translation(&name, format!("compute {} skipped: a ray-tracing resolve (VICTORY_SKIP_NAMES, VICTORY_SKIP_RAY_WALKS)", s.hash));
+        return Pipe::Refused;
+    }
     let mut hosts = Vec::new();
     for (stage, shader) in &stages {
         match shader.native() {
