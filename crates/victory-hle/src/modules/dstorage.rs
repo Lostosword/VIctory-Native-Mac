@@ -411,7 +411,16 @@ fn log_pending(this: Array, index: u32, polls: u64) {
             )
         })
         .collect();
-    tracing::warn!(array = ?this, index, polls, staged = lanes.staged, ?state, "dstorage: a status entry is still pending");
+    // The reads running longest: what the status waits behind.
+    let mut running: Vec<String> = RUNNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|((lane, seq), (since, what))| format!("lane {lane} #{seq} for {:.1}s: {what}", since.elapsed().as_secs_f64()))
+        .collect();
+    running.sort();
+    running.truncate(4);
+    tracing::warn!(array = ?this, index, polls, staged = lanes.staged, ?state, ?running, "dstorage: a status entry is still pending");
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -505,6 +514,10 @@ struct Lane {
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
+/// Reads started and not finished, by lane and sequence: when they started and what they are
+/// (for the pending-status log).
+static RUNNING: Mutex<BTreeMap<(u64, u64), (std::time::Instant, String)>> = Mutex::new(BTreeMap::new());
+
 struct Job {
     lane: u64,
     seq: u64,
@@ -668,6 +681,10 @@ impl Lanes {
         }
         lane.reads.pop_front();
         lane.running.insert(seq);
+        RUNNING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((id, seq), (std::time::Instant::now(), format!("{} options {:#x} offset {} source {} destination {}", source_name(&request), request.options, request.offset, request.source_size, request.destination_size)));
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
@@ -683,6 +700,7 @@ impl Lanes {
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).remove(&(job.lane, job.seq));
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
