@@ -267,6 +267,37 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+/// `s_sext_i32_i8` and `s_sext_i32_i16` leave SCC as it was (RDNA2 ISA, SOP1;
+/// neither sets SCC). Their values: `victory-gpu`'s
+/// `addr_tests::scalar_sign_extensions_on_the_gpu`.
+#[test]
+fn scalar_sign_extensions_keep_scc() {
+    // SCC = (s1 == 0), then the extension of s0 into s16, then SCC into v0.
+    let body = |opcode: u32| {
+        [
+            0xBF06_8001,               // s_cmp_eq_u32 s1, 0
+            0xBE90_0000 | opcode << 8, // s_sext_i32_i8/i16 s16, s0
+            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
+            vop1(1, 0, sgpr(18)),      // v_mov_b32 v0, s18
+        ]
+    };
+    // (s0, s1), then SCC after. Non-zero results with SCC 0, and zero ones
+    // with SCC 1 (the last case, in both forms), catch an extension that sets it.
+    let cases = [
+        ([0x0000_007F, 1, 0, 0], 0),
+        ([0x0000_0080, 0, 0, 0], 1),
+        ([0x1234_80FF, 1, 0, 0], 0),
+        ([0xFFFF_0000, 0, 0, 0], 1),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for opcode in [0x19, 0x1a] {
+        let shader = build_valu_cs(&body(opcode));
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            assert_eq!(got, cases[i].1, "{backend}, opcode {opcode:#x}, case {i}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -979,6 +1010,46 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
             inp[0],
         );
     });
+}
+
+#[test]
+fn signed_i16_add_and_sub_wrap_or_saturate_in_the_selected_half() {
+    for (op, opsel, inputs, wrapped, saturated) in [
+        // 32767 + 1, then -2 + -1: high src0, low src1, low destination.
+        (
+            0x30d,
+            0b0001,
+            [
+                [0x7fff_2222, 0x3333_0001, 0xa1b2_c3d4, 0],
+                [0xfffe_2222, 0x3333_ffff, 0xa1b2_c3d4, 0],
+            ],
+            [0xa1b2_8000, 0xa1b2_fffd],
+            [0xa1b2_7fff, 0xa1b2_fffd],
+        ),
+        // -32768 - 1, then -2 - (-1): low src0, high src1, high destination.
+        (
+            0x30e,
+            0b1010,
+            [
+                [0x2222_8000, 0x0001_3333, 0xa1b2_c3d4, 0],
+                [0x2222_fffe, 0xffff_3333, 0xa1b2_c3d4, 0],
+            ],
+            [0x7fff_c3d4, 0xffff_c3d4],
+            [0x8000_c3d4, 0xffff_c3d4],
+        ),
+    ] {
+        for (clamp, expected) in [(false, wrapped), (true, saturated)] {
+            let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), 0);
+            let shader = build_valu_cs(&[
+                vop1(0x001, 0, vgpr(3)),
+                w0 | opsel << 11 | u32::from(clamp) << 15,
+                w1,
+            ]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                assert_eq!(got, expected[i], "{backend} op={op:#x} clamp={clamp}");
+            });
+        }
+    }
 }
 
 #[test]

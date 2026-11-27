@@ -44,6 +44,12 @@ pub use glue::{
     shader_stats,
 };
 
+/// Has a title's new render pipelines compile in the background (`victory_metal::gfx::Pso`).
+#[cfg(target_os = "macos")]
+pub fn set_background_pipelines(on: bool) {
+    victory_metal::gfx::set_background_pipelines(on);
+}
+
 /// Reads `out.len()` bytes at `at` from this process, false if they cannot be read (unmapped
 /// memory: the kernel checks, nothing faults).
 pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
@@ -81,3 +87,6 @@ pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
+
+#[cfg(test)]
+mod vertex_tests;

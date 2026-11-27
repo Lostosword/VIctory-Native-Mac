@@ -135,6 +135,18 @@ pub(super) fn translate_wave(
     wave64: bool,
     options: victory_shader::emit::Options,
 ) -> HostShader {
+    try_translate_wave(words, sgprs, rsrc2, threads, wave64, options).expect("emit")
+}
+
+/// [`translate_wave`], or what the translation refuses.
+pub(super) fn try_translate_wave(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    wave64: bool,
+    options: victory_shader::emit::Options,
+) -> Result<HostShader, victory_shader::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -166,7 +178,7 @@ pub(super) fn translate_wave(
     empty.extend(32u32.to_le_bytes());
     empty.extend(0u32.to_le_bytes());
     let c = Container::parse(&empty).expect("container");
-    emit_with(&c, &native, &p, &st, &io, &res, options).expect("emit")
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
 pub(super) fn title() -> Option<Title<Metal>> {
@@ -510,6 +522,76 @@ fn guessed_vertex_buffer_reads_the_pool() {
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
+/// A vertex shader fetching its positions through a root SRV (Grand Theft Auto VI's vertex fetch)
+/// reads them at the title's addresses across two title pages that are not next to each other in
+/// the pool: the first vertex at the end of one 64 KiB page, the others at the start of the next,
+/// which the title mapped elsewhere in the pool (pages mapped in descending pool order). A view of
+/// the pool from the root address on read the pool's own next bytes there (the canary): the
+/// triangle had no area and nothing was drawn.
+#[test]
+fn a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool() {
+    let vertex = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0x8805_FF01, 0x0008_0000, // s_or_b32 s5, s1, 0x80000 (stride 8)
+        0xBE86_03C1, // s_mov_b32 s6, -1 (no record limit, as the title builds them)
+        0xBE87_03FF, 0x0001_4FAC, // s_mov_b32 s7, 0x14fac
+        0xE034_2000, 0x8001_0100, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 idxen
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_02F2, // v_mov_b32 v4, 1.0
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let pixel = [
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0xF800_180F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let translate = |stage, words: &[u32], meta: &[u8]| {
+        let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let c = victory_shader::emit::graphics::container(stage, &bytes, meta).unwrap();
+        shaders::translate(&c).unwrap()
+    };
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x15] = 1; // A root SRV (kind 0, root descriptor) in slot 0, user data 0-1.
+    let vs = translate(HwStage::Vs, &vertex, &meta);
+    let ps = translate(HwStage::Ps, &pixel, &[0; 0x10]);
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    // Two title pages, at pool offsets 0x4_0000 and 0x8_0000: the pool after the first is canary.
+    const VA_C: u64 = 0x7100_0000;
+    t.host.memory().mapped(VA_C as usize, 0x1_0000, &f.info, 0x4_0000);
+    t.host.memory().mapped(VA_C as usize + 0x1_0000, 0x1_0000, &f.info, 0x8_0000);
+    // A triangle over the whole target: its first vertex in the first page, the others in the next.
+    f.put(0x4_FFF8, &[-1.0f32, -1.0]);
+    f.put(0x8_0000, &[3.0f32, -1.0, -1.0, 3.0]);
+
+    let state = Graphics::guess_base()
+        .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "root view vertex") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let color = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&color), None);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.set_graphics_root_view(0, VA_C + 0xFFF8);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut pixels = [0; 8 * 8 * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    for p in pixels.chunks(4) {
+        assert_eq!(p, [255, 128, 128, 255]);
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
 /// The table follows the title's maps: the same dispatch, the same title addresses, after the title
 /// mapped the pages somewhere else.
 #[test]
@@ -758,5 +840,94 @@ fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
     let ids: Vec<u32> = (0..64).collect();
     assert_eq!(f.get(0x2_0000 + 1024, 64), ids, "wave64 ds_write_addtid_b32");
     assert_eq!(f.get(0x2_0000 + 1280, 64), ids, "wave64 ds_read_addtid_b32");
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// A structured buffer view (16-byte elements) whose descriptor the program loads and then clears
+/// the stride of (`s_and_b32` of dword 1 with 0xc000ffff, a title's form): every lane loads by
+/// index and offset, so with stride 0 it reads dword `lane` (index × 0 + lane × 4, RDNA2 ISA
+/// 8.1.5), and stores it to a raw view.
+const STRIDE_CLEARED: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xF408_0302, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x8709_FF09, 0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff
+    0xE030_3000, 0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_1000, 0x8003_0201, // buffer_store_dword v2, v1, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
+    use victory_shader::native::{ResourceType, UsedResource};
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let src: Vec<u32> = (0..64).map(|i| i * 7 + 3).collect();
+    f.put(0x2_1000, &src);
+    f.put(0x2_2000, &[0u32; 64]);
+    // The title's heap: a structured SRV of 16-byte elements, then a raw UAV.
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let (rs, rd) = (0x57D_0001usize, 0x57D_0002usize);
+    t.host.register_buffer(rs, VA_A + 0x1000, 4096);
+    t.host.register_buffer(rd, VA_A + 0x2000, 4096);
+    let mut srv = [0u32; 10];
+    (srv[1], srv[6], srv[7]) = (1, 16, 16);
+    let mut uav = [0u32; 10];
+    (uav[1], uav[4], uav[8]) = (1, 64, 1);
+    crate::descriptor::create_srv(std::ptr::null(), rs as _, &srv, start);
+    crate::descriptor::create_uav(std::ptr::null(), rd as _, std::ptr::null(), &uav, start + 32);
+    assert!(t.host.mirror(start).unwrap() && t.host.mirror(start + 32).unwrap());
+    let used = |kind, table_offset_dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data: 4,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: vec![used(ResourceType::Srv, 0, 16), used(ResourceType::Uav, 8, 0)],
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] }),
+        code: STRIDE_CLEARED.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let mut empty = b"DXBC".to_vec();
+    empty.extend([0; 16]);
+    empty.extend([1, 0, 0, 0]);
+    empty.extend(32u32.to_le_bytes());
+    empty.extend(0u32.to_le_bytes());
+    let c = Container::parse(&empty).expect("container");
+    let cs = emit_with(&c, &native, &p, &st, &io, &res, shaders::options()).expect("emit");
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "stride") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_2000, 32), src[..32]);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }

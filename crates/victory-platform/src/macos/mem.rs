@@ -129,9 +129,13 @@ pub unsafe fn reserve(at: Option<usize>, len: usize) -> io::Result<*mut u8> {
         mach_vm_allocate(task(), &mut addr, len as u64, flags)
     })?;
     // SAFETY: the range was just allocated.
-    check("mach_vm_protect", unsafe {
+    if let Err(e) = check("mach_vm_protect", unsafe {
         mach_vm_protect(task(), addr, len as u64, 0, 0)
-    })?;
+    }) {
+        // SAFETY: release the allocation we just made so it does not leak.
+        unsafe { mach_vm_deallocate(task(), addr, len as u64) };
+        return Err(e);
+    }
     Ok(addr as *mut u8)
 }
 
@@ -252,6 +256,9 @@ pub unsafe fn reserve_in(
     len: usize,
     align: usize,
 ) -> io::Result<*mut u8> {
+    let Some(step) = align.max(page_size()).checked_next_power_of_two() else {
+        return Err(io::Error::other("alignment overflow"));
+    };
     // A gap the walk sees as free may not be (a test binary's page zero is
     // not a region): the next one up then.
     let mut from = lowest;
@@ -260,7 +267,10 @@ pub unsafe fn reserve_in(
         if let Ok(p) = unsafe { reserve(Some(start), len) } {
             return Ok(p);
         }
-        from = start + align.max(page_size());
+        let Some(next) = start.checked_add(step) else {
+            break;
+        };
+        from = next;
     }
     Err(io::Error::other("no free address range below the limit"))
 }
@@ -268,16 +278,19 @@ pub unsafe fn reserve_in(
 /// The lowest address at or above `lowest`, a multiple of `align`, where
 /// `len` bytes lie free and end at or below `highest`.
 fn free_gap(lowest: usize, highest: usize, len: usize, align: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
     // Walk the mapped regions for the first gap that fits: the kernel's own
     // "anywhere" placement ignores the hint when the process is full of
     // libraries (a window brings Metal's) and lands above `highest`.
-    let align = align.max(page_size()).next_power_of_two();
+    let align = align.max(page_size()).checked_next_power_of_two()?;
     let up = |a: usize| a.checked_add(align - 1).map(|v| v & !(align - 1));
     let mut at = up(lowest);
     while let Some(start) = at {
         let end = start.checked_add(len).filter(|&e| e - 1 <= highest)?;
         match next_region(start) {
-            Some(r) if r.base < end => at = up(r.base + r.len),
+            Some(r) if r.base < end => at = r.base.checked_add(r.len).and_then(up),
             _ => return Some(start),
         }
     }
@@ -340,9 +353,59 @@ pub fn next_region(addr: usize) -> Option<Region> {
 /// Other mappings come and go at the caller's addresses.
 #[derive(Debug)]
 pub struct PagePool {
+    mapping: PoolMapping<MachCleanup>,
+}
+
+#[derive(Debug)]
+struct PoolMapping<C: PoolCleanup> {
     entry: MachPort,
     len: usize,
     base: usize,
+    cleanup: C,
+}
+
+trait PoolCleanup {
+    fn unmap(&self, base: usize, len: usize);
+    fn release_entry(&self, entry: MachPort);
+}
+
+#[derive(Debug)]
+struct MachCleanup;
+
+impl PoolCleanup for MachCleanup {
+    fn unmap(&self, base: usize, len: usize) {
+        // SAFETY: PoolMapping owns the mapping until drop.
+        unsafe { mach_vm_deallocate(task(), base as u64, len as u64) };
+    }
+
+    fn release_entry(&self, entry: MachPort) {
+        // SAFETY: this is the send right acquired for the pool.
+        unsafe { mach_port_deallocate(task(), entry) };
+    }
+}
+
+impl<C: PoolCleanup> PoolMapping<C> {
+    fn new(
+        entry: MachPort,
+        len: usize,
+        cleanup: C,
+        map: impl FnOnce(MachPort, usize) -> io::Result<*mut u8>,
+    ) -> io::Result<Self> {
+        let base = map(entry, len).inspect_err(|_| cleanup.release_entry(entry))?;
+        Ok(Self {
+            entry,
+            len,
+            base: base as usize,
+            cleanup,
+        })
+    }
+}
+
+impl<C: PoolCleanup> Drop for PoolMapping<C> {
+    fn drop(&mut self) {
+        self.cleanup.unmap(self.base, self.len);
+        self.cleanup.release_entry(self.entry);
+    }
 }
 
 // SAFETY: a Mach port name is a process-wide integer.
@@ -371,15 +434,11 @@ impl PagePool {
                 0,
             )
         })?;
-        let mut pool = PagePool {
-            entry,
-            len: size as usize,
-            base: 0,
-        };
-        // SAFETY: anywhere, so nothing of the caller's is replaced. On
-        // failure `pool` drops and gives the port back.
-        pool.base = unsafe { pool.map(0, pool.len, None, Protect::READ_WRITE) }? as usize;
-        Ok(pool)
+        let mapping = PoolMapping::new(entry, size as usize, MachCleanup, |entry, len| {
+            // SAFETY: map the entire new entry anywhere, without replacing a caller's range.
+            unsafe { Self::map_entry(entry, 0, len, None, Protect::READ_WRITE) }
+        })?;
+        Ok(PagePool { mapping })
     }
 
     /// As [`new`](PagePool::new). Memory is committed on first touch here
@@ -389,33 +448,33 @@ impl PagePool {
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.mapping.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.mapping.len == 0
     }
 
     /// The pool's permanent read-write mapping of all of it (always `Some`
     /// here; a Windows host may fail to map a large pool).
     pub fn base(&self) -> Option<*mut u8> {
-        Some(self.base as *mut u8)
+        Some(self.mapping.base as *mut u8)
     }
 
     /// The Mach memory entry (a send right the pool keeps): a `mach_vm_map`
     /// of the caller's own maps the same pages.
     pub fn memory_entry(&self) -> u32 {
-        self.entry
+        self.mapping.entry
     }
 
     /// Bytes `[offset, offset + len)` through [`base`](PagePool::base): no
     /// mapping of its own here.
     pub fn window(&self, offset: usize, len: usize) -> io::Result<Window> {
-        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+        if offset.checked_add(len).is_none_or(|end| end > self.mapping.len) {
             return Err(io::Error::other("range outside the page pool"));
         }
         Ok(Window {
-            at: self.base + offset,
+            at: self.mapping.base + offset,
         })
     }
 
@@ -432,9 +491,20 @@ impl PagePool {
         at: Option<usize>,
         prot: Protect,
     ) -> io::Result<*mut u8> {
-        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+        if offset.checked_add(len).is_none_or(|end| end > self.mapping.len) {
             return Err(io::Error::other("range outside the page pool"));
         }
+        // SAFETY: the range is within the entry and the caller owns any fixed address.
+        unsafe { Self::map_entry(self.mapping.entry, offset, len, at, prot) }
+    }
+
+    unsafe fn map_entry(
+        entry: MachPort,
+        offset: usize,
+        len: usize,
+        at: Option<usize>,
+        prot: Protect,
+    ) -> io::Result<*mut u8> {
         let try_map = |at: u64, flags: i32, mask: u64| -> io::Result<*mut u8> {
             let mut addr = at;
             // SAFETY: maps our own memory entry; FIXED|OVERWRITE replaces the
@@ -446,7 +516,7 @@ impl PagePool {
                     len as u64,
                     mask,
                     flags,
-                    self.entry,
+                    entry,
                     offset as u64,
                     0,
                     prot.0 as i32,
@@ -489,17 +559,6 @@ impl PagePool {
     }
 }
 
-impl Drop for PagePool {
-    fn drop(&mut self) {
-        // SAFETY: our own base mapping and port right; other mappings keep
-        // the memory alive until they go.
-        unsafe {
-            mach_vm_deallocate(task(), self.base as u64, self.len as u64);
-            mach_port_deallocate(task(), self.entry);
-        }
-    }
-}
-
 /// Bytes of a pool, writable in place (see [`PagePool::window`]).
 #[derive(Debug)]
 pub struct Window {
@@ -530,4 +589,64 @@ pub unsafe fn unmap_over(addr: *mut u8, len: usize) -> io::Result<()> {
 pub unsafe fn unmap(addr: *mut u8, len: usize) -> io::Result<()> {
     // SAFETY: forwarded from the caller.
     unsafe { release(addr, len) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    enum CleanupCall {
+        Unmap(usize, usize),
+        Release(MachPort),
+    }
+
+    #[derive(Default)]
+    struct CleanupLog(std::cell::RefCell<Vec<CleanupCall>>);
+
+    impl PoolCleanup for &CleanupLog {
+        fn unmap(&self, base: usize, len: usize) {
+            self.0.borrow_mut().push(CleanupCall::Unmap(base, len));
+        }
+
+        fn release_entry(&self, entry: MachPort) {
+            self.0.borrow_mut().push(CleanupCall::Release(entry));
+        }
+    }
+
+    #[test]
+    fn failed_pool_mapping_only_releases_the_entry() {
+        let log = CleanupLog::default();
+        let result = PoolMapping::new(42, KERNEL_PAGE, &log, |_, _| {
+            Err(io::Error::other("mapping failed"))
+        });
+        assert!(result.is_err());
+        assert_eq!(*log.0.borrow(), [CleanupCall::Release(42)]);
+    }
+
+    #[test]
+    fn pool_drop_unmaps_the_returned_range_then_releases_the_entry() {
+        let log = CleanupLog::default();
+        let base = 0x1_2345_0000;
+        let len = 3 * KERNEL_PAGE;
+        let mapping = PoolMapping::new(42, len, &log, |entry, size| {
+            assert_eq!((entry, size), (42, len));
+            Ok(base as *mut u8)
+        })
+        .unwrap();
+        assert!(log.0.borrow().is_empty());
+        drop(mapping);
+        assert_eq!(
+            *log.0.borrow(),
+            [CleanupCall::Unmap(base, len), CleanupCall::Release(42)]
+        );
+    }
+
+    #[test]
+    fn free_gap_rejects_zero_length_and_overflowing_alignment() {
+        assert_eq!(free_gap(0, usize::MAX, 0, page_size()), None);
+        assert_eq!(free_gap(0x10000, usize::MAX, 0, page_size()), None);
+        assert_eq!(free_gap(0, usize::MAX, page_size(), (usize::MAX >> 1) + 2), None);
+        assert_eq!(free_gap(usize::MAX, usize::MAX, page_size(), page_size()), None);
+    }
 }

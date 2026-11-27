@@ -5,11 +5,10 @@
 //! lanes with `v_cndmask`, then DPP, `v_permlanex16` and `v_readlane`
 //! steps). A host lane that is elsewhere cannot run that code, so each
 //! section is simulated on the console's lanes with symbolic values, and a
-//! value it leaves is lowered by what it turned out to be: the reduction or
-//! prefix of one operation over the lanes' (masked) inputs, which DXIL's
-//! wave operations compute over the host's active lanes. No instruction
-//! sequence is matched; any step the simulation does not model leaves the
-//! values it writes unknown.
+//! value it leaves is lowered by what it turned out to be, such as a lane
+//! read or a reduction or prefix over the lanes' (masked) inputs. No
+//! instruction sequence is matched. Any unmodelled step leaves the values
+//! it writes unknown.
 
 use std::collections::HashMap;
 
@@ -21,6 +20,7 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    MulF,
     MinU,
     MaxU,
     MinI,
@@ -40,6 +40,7 @@ impl Op {
             // The low dwords of a 64-bit sum (the carry is not followed).
             "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_mul_f32" => Op::MulF,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -58,6 +59,7 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::MulF => k == 0x3F80_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -69,7 +71,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
+        matches!(self, Op::AddU | Op::AddF | Op::MulF | Op::Xor | Op::AddH)
     }
 }
 
@@ -78,8 +80,8 @@ impl Op {
 pub(crate) enum Sym {
     Unknown,
     K(u32),
-    /// The lane's own value of a VGPR value from before the section.
-    Own(Value),
+    /// A VGPR value from before the section and the source lane that held it.
+    Lane(Value, u32),
     /// A uniform value from before the section.
     Uni(Value),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
@@ -109,6 +111,8 @@ pub(crate) enum Sym {
 pub(crate) enum Shape {
     K(u32),
     Value(Value),
+    /// Every lane reads the same source lane's VGPR value.
+    ReadLane(Value, u32),
     /// The lane's own `mask ? src : ident`.
     Masked(Value, Value, u32),
     /// `op` over every lane.
@@ -149,14 +153,40 @@ const VALU: &str = unfollowed!("a VALU operation it does not model");
 /// Every step modelled, but the value is no single reduction or prefix.
 pub(crate) const NO_SHAPE: &str = unfollowed!("a value that is no reduction or prefix");
 
+/// Section lowering can replace register results, but cannot replay effects on
+/// lanes the host is not executing. Admit register operations conservatively.
+pub(super) fn register_only(inst: &Inst) -> bool {
+    match &inst.fields {
+        Fields::Valu(v) => v.dst.is_some(),
+        Fields::Sop { .. } => {
+            matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64")
+        }
+        _ => false,
+    }
+}
+
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
-    let mut i = 0;
-    while i < insts.len() {
-        let inst = &insts[i];
+    let mut from = 0;
+    while let Some((start, end, saved)) = next_section(insts, from) {
+        let (shapes, why) = simulate(&insts[start + 1..end], wave, saved);
+        out.insert(start, Section { end, shapes, why });
+        from = end + 1;
+    }
+    out
+}
+
+/// Whether any block has a whole-wave section, including one with unmodelled steps.
+pub(super) fn has_sections(p: &Program) -> bool {
+    p.blocks.iter().any(|b| next_section(&b.insts, 0).is_some())
+}
+
+/// The next save and restore indices and the saved EXEC value.
+fn next_section(insts: &[Inst], from: usize) -> Option<(usize, usize, Value)> {
+    for (i, inst) in insts.iter().enumerate().skip(from) {
         // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`.
         let all = match inst.name() {
             "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(Operand::Const(193)),
@@ -174,21 +204,15 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             _ => None,
         };
         let Some(saved) = saved else {
-            i += 1;
             continue;
         };
         let end = (i + 1..insts.len()).find(|&j| {
             insts[j].write(Reg::S(EXEC)).is_some()
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
-        });
-        let Some(end) = end else {
-            break;
-        };
-        let (shapes, why) = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes, why });
-        i = end + 1;
+        })?;
+        return Some((i, end, saved));
     }
-    out
+    None
 }
 
 fn saved_code(inst: &Inst) -> u8 {
@@ -334,11 +358,18 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static SIMULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn simulate(
     insts: &[Inst],
     wave: u32,
     saved: Value,
 ) -> (HashMap<Value, Shape>, Option<&'static str>) {
+    #[cfg(test)]
+    SIMULATIONS.set(SIMULATIONS.get() + 1);
     let mut why = None;
     let all = if wave == 64 {
         u64::MAX
@@ -381,6 +412,14 @@ fn simulate(
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
+            // A reduction can load its inactive-lane identity into an SGPR.
+            if name == "s_mov_b32"
+                && let Some(k) = constant(inst)
+                && let [(Reg::S(_), dst)] = inst.writes.as_slice()
+            {
+                uni.insert(*dst, Sym::K(k as u32));
+                continue;
+            }
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
@@ -411,7 +450,7 @@ fn simulate(
                     Some(x) => vec
                         .get(&x)
                         .cloned()
-                        .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
+                        .unwrap_or_else(|| (0..wave).map(|l| Sym::Lane(x, l)).collect()),
                     None => one(Sym::Unknown),
                 },
                 Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
@@ -514,9 +553,13 @@ fn simulate(
                     _ => None,
                 };
                 let b = src(1).unwrap_or_default();
-                (0..wave as usize)
-                    .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                a.into_iter()
+                    .enumerate()
+                    .map(|(l, a)| match (a, b.get(l).copied(), mask) {
+                        // This reduction term uses the same lane for the value and mask.
+                        (Sym::K(ident), Some(Sym::Lane(x, source)), Some(m))
+                            if source as usize == l && masked.contains(&m) =>
+                        {
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -537,6 +580,12 @@ fn simulate(
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                        match uni.get(&inst.read(Reg::S(code))?) {
+                            Some(&Sym::K(x)) => Some(x),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
@@ -661,9 +710,24 @@ fn shapes(
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
-    let single = |s: Sym| match s {
+    for (v, s) in uni {
+        if let Some(sh) = uniform_shape(s, all) {
+            out.insert(v, sh);
+        }
+    }
+    for (v, lanes) in vec {
+        if let Some(sh) = per_lane(&lanes, all) {
+            out.insert(v, sh);
+        }
+    }
+    out
+}
+
+fn uniform_shape(s: Sym, all: u64) -> Option<Shape> {
+    match s {
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Lane(x, source) => Some(Shape::ReadLane(x, source)),
         Sym::Red {
             op: Some(op),
             src,
@@ -680,22 +744,19 @@ fn shapes(
             hi,
         } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
         _ => None,
-    };
-    for (v, s) in uni {
-        if let Some(sh) = single(s) {
-            out.insert(v, sh);
-        }
     }
-    for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
-            out.insert(v, sh);
-        }
-    }
-    out
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     let first = lanes[0];
+    if let Sym::Lane(x, 0) = first
+        && lanes
+            .iter()
+            .enumerate()
+            .all(|(l, &s)| s == Sym::Lane(x, l as u32))
+    {
+        return Some(Shape::Value(x));
+    }
     let own = |l: usize, s: Sym| match s {
         Sym::Red {
             op: None,
@@ -712,18 +773,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         return Some(Shape::Masked(m.0, m.1, m.2));
     }
     if lanes.iter().all(|&s| s == first) {
-        return match first {
-            Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
-            Sym::Red {
-                op: Some(op),
-                src,
-                mask,
-                ident,
-                lanes,
-            } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
-            _ => None,
-        };
+        return uniform_shape(first, all);
     }
     // Prefixes: lane l holds lanes 0..l (exclusive) or 0..=l (inclusive).
     let mut meta: Option<(Value, Value, u32, bool)> = None;

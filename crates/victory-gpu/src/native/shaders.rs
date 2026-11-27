@@ -59,6 +59,12 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
     translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
 }
 
+/// Whether [`translate_extra`]'s translation is in the disk cache already.
+pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
+    let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
+    crate::shader_cache::native_present(container, &format!("{o:?}"))
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
 /// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
 /// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
@@ -150,10 +156,9 @@ impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
-        // shortcut: compute shaders indexing the heap itself stay refused (graphics ones run);
-        // lift it once a compute value test reads a heap-indexed view.
-        let why = unsupported(shader, true).or(shader.heap.then_some("indexes the descriptor heap itself"));
-        if let Some(why) = why {
+        // Shaders indexing the heap themselves run: the heaps are bound for compute as for render
+        // (`heap_tests::a_compute_shader_loads_a_texture_by_heap_index`).
+        if let Some(why) = unsupported(shader, true) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
@@ -174,7 +179,7 @@ impl<B: PresentBackend> Title<B> {
         };
         // Translator output carries no root signature: the argument buffer is laid out by the
         // binding the host fills it by.
-        let binding = Binding::of(shader);
+        let binding = Binding { name: name.into(), ..Binding::of(shader) };
         let made = match binding.layout() {
             Some(l) => self.host.backend.create_compute_pipeline_with(&shader.dxil, &l),
             None => self.host.backend.create_compute_pipeline(&shader.dxil),
@@ -259,9 +264,9 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
-        let vs_binding = Binding::of(vs);
+        let vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
         let ps_binding = ps
-            .map(Binding::of)
+            .map(|ps| Binding { name: name.into(), ..Binding::of(ps) })
             .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its

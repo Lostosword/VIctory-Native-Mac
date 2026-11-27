@@ -1,6 +1,7 @@
 //! Guessed graphics shaders that take descriptors from the resource heap themselves (an SGPR the
 //! translator infers as a `ResourceHeap` base, not a table): hand-assembled GFX10 drawn on Metal,
-//! with the title's heap bound for the vertex, mesh and pixel stages.
+//! with the title's heap bound for the vertex, mesh and pixel stages; and a compute program with
+//! no heap record whose user SGPR the translator infers as the heap (`native::infer_heaps`).
 
 use super::addr_tests::title;
 use crate::native::list::{NativeHeap, NativeList};
@@ -22,7 +23,8 @@ fn translate(stage: HwStage, words: &[u32]) -> HostShader {
 }
 
 /// A title resource heap of two 1x1 RGBA8 textures: entry 0 red, entry 1 green. A shader that
-/// reads entry 1 sees green; one that read entry 0 (or nothing) would not.
+/// reads entry 1 sees green; one that read entry 0 (or nothing) would not. Entry 2 is left for a
+/// test's own view.
 struct Heap {
     heap: Rc<NativeHeap<Metal>>,
     _records: Vec<u32>,
@@ -30,9 +32,9 @@ struct Heap {
 
 impl Heap {
     fn new(t: &Title<Metal>) -> Heap {
-        let records = vec![0u32; 8 * 2];
+        let records = vec![0u32; 8 * 3];
         let start = records.as_ptr() as u64;
-        let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+        let heap = t.host.heap(HeapKind::Resource, start, 3).unwrap();
         for (i, texel) in [[255, 0, 0, 255], [0, 255, 0, 255]].into_iter().enumerate() {
             let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
             t.host.backend.upload_texture(&tex, 0, 0, &texel, 4, 0);
@@ -93,6 +95,65 @@ const COVER: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// A pixel input the vertex shader does not write, added to it (`translate_extra`) with another
+/// parameter's values, beside a `HALF` of the same index: the pair converts, the input gets the
+/// copied values and the `HALF` keeps its own. The vertex shader exports param1 and param3 as
+/// packed halves (0.25 and 0.5: `HALF2`, `HALF6`) and param2 as 1.0; `TEXCOORD6` is written with
+/// param2's values. The pixel shader writes attr6.x (flat) to red and blue, and attr3.x's low half
+/// to green. Before, the converter refused the pair (`TEXCOORD6` was taken for written), and the
+/// copy then overwrote `HALF6` with `HALF2` (green 64).
+#[test]
+fn an_extra_parameter_beside_a_half_of_its_index_links_with_its_own_values() {
+    let mut vs_words = COVER.to_vec();
+    let at = vs_words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    vs_words.splice(
+        at..at,
+        [
+            0x7E0A_02F0, // v_mov_b32 v5, 0.5
+            0x7E0E_02FF,
+            0x3E80_0000, // v_mov_b32 v7, 0.25
+            0x5E10_0B05, // v_cvt_pkrtz_f16_f32 v8, v5, v5
+            0x5E12_0F07, // v_cvt_pkrtz_f16_f32 v9, v7, v7
+            0x1018_0D06, // v_mul_f32 v12, v6, v6 (1.0)
+            // param3 first: a copy made at param1's export would be the last write to `HALF6`.
+            0xF800_0231,
+            0x0000_0008, // exp param3 v8
+            0xF800_0211,
+            0x0000_0009, // exp param1 v9
+            0xF800_0221,
+            0x0000_000C, // exp param2 v12
+        ],
+    );
+    let ps_words = [
+        0xC80E_1802, // v_interp_mov_f32 v3, p0, attr6.x
+        0xD742_0002,
+        0x0202_0003, // v_interp_p1ll_f16 v2, v0, attr3.x
+        0xD75A_0004,
+        0x040A_0203, // v_interp_p2_f16 v4, v1, attr3.x, v2
+        0x7E08_1704, // v_cvt_f32_f16 v4, v4
+        0xF800_180F,
+        0x0303_0403, // exp mrt0 v3, v4, v3, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let bytes: Vec<_> = vs_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let c = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let mut copy = [0; 32];
+    copy[6] = 3; // TEXCOORD2 + 1
+    let vs = shaders::translate_extra(&c, false, 1 << 6, copy).unwrap();
+    let ps = translate(HwStage::Ps, &ps_words);
+    let Some(mut t) = title() else { return };
+    let heap = Heap::new(&t);
+    let pixels = draw(&mut t, &heap, &vs, &ps, |l| {
+        l.draw_instanced(3, 1, 0, 0).unwrap()
+    });
+    assert!(
+        pixels.iter().all(|p| *p == [255, 128, 255, 255]),
+        "{pixels:?}"
+    );
+}
+
 /// A pixel shader that loads the image descriptor at heap entry 1 (byte 0x20 from the heap base in
 /// s2, high half 0) and writes its texel (0, 0).
 const PS_HEAP: &[u32] = &[
@@ -114,6 +175,25 @@ fn a_pixel_shader_loads_a_texture_by_heap_index() {
     assert!(ps.heap && !vs.heap);
     let Some(mut t) = title() else { return };
     let heap = Heap::new(&t);
+    let pixels = draw(&mut t, &heap, &vs, &ps, |l| l.draw_instanced(3, 1, 0, 0).unwrap());
+    assert!(pixels.iter().all(|p| *p == [0, 255, 0, 255]), "{pixels:?}");
+}
+
+#[test]
+fn a_pixel_shader_reads_the_heap_entry_after_masking_the_address_carry() {
+    // Address entry 1 explicitly, then run the same image load and export as PS_HEAP.
+    let mut words = vec![
+        0x8002_A002, // s_add_u32 s2, s2, 32
+        0x8203_8080, // s_addc_u32 s3, 0, 0
+        0x8703_FF03, 0xff, // s_and_b32 s3, s3, 0xff
+        0xF40C_0101, 0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], 0
+    ];
+    words.extend_from_slice(&PS_HEAP[3..]);
+    let ps = translate(HwStage::Ps, &words);
+    assert!(ps.heap);
+    let Some(mut t) = title() else { return };
+    let heap = Heap::new(&t);
+    let vs = translate(HwStage::Vs, COVER);
     let pixels = draw(&mut t, &heap, &vs, &ps, |l| l.draw_instanced(3, 1, 0, 0).unwrap());
     assert!(pixels.iter().all(|p| *p == [0, 255, 0, 255]), "{pixels:?}");
 }
@@ -200,4 +280,58 @@ fn a_released_texture_leaves_the_heap() {
     // A texture at the released one's address: the entry is checked again, the other is not.
     t.host.register_texture(green, &t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap());
     assert!(!heap.heap.mirrored.borrow().contains_key(&1) && heap.heap.mirrored.borrow().contains_key(&0));
+}
+
+/// A compute program of the title's shape: a raw UAV in the table at user data 4, and the
+/// resource heap's base in s6, which no metadata record names. It loads the image descriptor at
+/// heap entry 1 and stores its texel's green channel (1.0; 0.0 for entry 0) through the UAV.
+const CS_HEAP: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xBE80_0306, // s_mov_b32 s0, s6
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF40C_0400, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[0:1], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF000_1F08, 0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// A compute program that indexes the heap through an undeclared user SGPR is translated with
+/// that SGPR as the heap, is not refused, and reads the entry it names.
+#[test]
+fn a_compute_shader_loads_a_texture_by_heap_index() {
+    // A raw UAV (kind 3) in a table (root type 3) at user data 4, slot 0.
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_HEAP, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.heap);
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "heap") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap.heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap.heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
 }
