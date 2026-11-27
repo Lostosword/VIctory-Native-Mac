@@ -138,6 +138,61 @@ fn walks_rays(container: &[u8]) -> bool {
     })
 }
 
+/// Translations that take long: each running one is listed, a watcher thread warns once of each
+/// past 20 s (`translation still running`), and `VICTORY_DUMP_SLOW=<dir>` writes its container
+/// there to translate it again alone. One that ends after 5 s or more is logged with its time.
+/// (Translations of minutes held the first world frame, and the title's lock with it.)
+#[cfg(target_os = "macos")]
+mod slow_translations {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    pub(super) struct Watch(u64, Instant, String);
+
+    static RUNNING: Mutex<Option<HashMap<u64, (Instant, String, Option<Vec<u8>>, bool)>>> = Mutex::new(None);
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(super) fn start(stage: &str, hash: &str, container: &[u8]) -> Watch {
+        static WATCHER: std::sync::Once = std::sync::Once::new();
+        WATCHER.call_once(|| {
+            let _ = std::thread::Builder::new().name("slow translations".into()).spawn(watch);
+        });
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("{stage} {hash}");
+        let copy = std::env::var_os("VICTORY_DUMP_SLOW").map(|_| container.to_vec());
+        let now = Instant::now();
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(id, (now, name.clone(), copy, false));
+        Watch(id, now, name)
+    }
+
+    pub(super) fn end(w: Watch) {
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(&w.0);
+        let took = w.1.elapsed();
+        if took >= Duration::from_secs(5) {
+            tracing::warn!(shader = w.2, seconds = took.as_secs_f64(), "slow translation");
+        }
+    }
+
+    fn watch() {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+            for (start, name, copy, told) in running.get_or_insert_with(HashMap::new).values_mut() {
+                if *told || start.elapsed() < Duration::from_secs(20) {
+                    continue;
+                }
+                *told = true;
+                tracing::warn!(shader = %name, seconds = start.elapsed().as_secs(), "translation still running");
+                if let (Some(dir), Some(bytes)) = (std::env::var_os("VICTORY_DUMP_SLOW"), copy.as_ref()) {
+                    let file = std::path::Path::new(&dir).join(format!("{}.bin", name.replace(' ', "_")));
+                    let _ = std::fs::write(file, bytes);
+                }
+            }
+        }
+    }
+}
+
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
@@ -254,7 +309,9 @@ impl Shader {
         self.native
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                let watch = slow_translations::start(self.stage, &self.hash, &container);
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
+                slow_translations::end(watch);
                 if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
                     && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
                 {

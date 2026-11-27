@@ -13561,7 +13561,12 @@ impl<'a> Lower<'a> {
             self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
         let mut live = Set::default();
         let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
-        while let Some((v, known)) = work.pop() {
+        // Sets of conditions a phi is reached under, at most this many before the phi goes on
+        // with none known (weaker, so still sound): large pixel shaders reached a phi under so
+        // many combinations that the walk never ended (eight translations still running after
+        // five minutes, the first world frame waiting on them).
+        const MAX_SETS: usize = 32;
+        while let Some((v, mut known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
@@ -13569,6 +13574,12 @@ impl<'a> Lower<'a> {
             // Known of fewer lanes than before: nothing new is live.
             if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
                 continue;
+            }
+            if done.len() >= MAX_SETS {
+                known.clear();
+                if done.iter().any(Vec::is_empty) {
+                    continue;
+                }
             }
             done.push(known.clone());
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
